@@ -12,7 +12,10 @@ app.set('view engine', 'ejs');
 app.use(bodyParser.urlencoded({extended: true}));
 app.use(express.static("public"));
 
-mongoose.connect("mongodb+srv://admin-samy:SS0119899102@todolist-lyxsq.mongodb.net/todolistDB", {useNewUrlParser: true,useUnifiedTopology: true });
+const databaseUri = process.env.MONGODB_URI;
+if (!databaseUri) {
+  throw new Error("MONGODB_URI is required");
+}
 
 const itemsSchema = {
   name: String
@@ -21,19 +24,11 @@ const itemsSchema = {
 const Item = mongoose.model("Item", itemsSchema);
 
 
-const item1 = new Item({
-  name: "Welcome to your todolist!"
-});
-
-const item2 = new Item({
-  name: "Hit the + button to add a new item."
-});
-
-const item3 = new Item({
-  name: "<-- Hit this to delete an item."
-});
-
-const defaultItems = [item1, item2, item3];
+const defaultItems = [
+  {_id: "000000000000000000000001", name: "Welcome to your todolist!"},
+  {_id: "000000000000000000000002", name: "Hit the + button to add a new item."},
+  {_id: "000000000000000000000003", name: "<-- Hit this to delete an item."}
+];
 
 const listSchema = {
   name: String,
@@ -43,92 +38,75 @@ const listSchema = {
 const List = mongoose.model("List", listSchema);
 
 
-app.get("/", function(req, res) {
-
-  Item.find({}, function(err, foundItems){
-
-    if (foundItems.length === 0) {
-      Item.insertMany(defaultItems, function(err){
-        if (err) {
-          console.log(err);
-        } else {
-          console.log("Successfully savevd default items to DB.");
-        }
-      });
+app.get("/", function(req, res, next) {
+  Item.find({}, function(err, foundItems) {
+    if (err) return next(err);
+    if (foundItems.length > 0) {
+      return res.render("list", {listTitle: "Today", newListItems: foundItems});
+    }
+    const defaults = defaultItems.map(item => ({
+      updateOne: {
+        filter: {_id: item._id},
+        update: {$setOnInsert: {name: item.name}},
+        upsert: true
+      }
+    }));
+    Item.bulkWrite(defaults, function(writeError) {
+      if (writeError) return next(writeError);
       res.redirect("/");
-    } else {
-      res.render("list", {listTitle: "Today", newListItems: foundItems});
-    }
+    });
   });
-
 });
 
-app.get("/:customListName", function(req, res){
+app.get("/:customListName", function(req, res, next) {
   const customListName = _.capitalize(req.params.customListName);
-
-  List.findOne({name: customListName}, function(err, foundList){
-    if (!err){
-      if (!foundList){
-        //Create a new list
-        const list = new List({
-          name: customListName,
-          items: defaultItems
-        });
-        list.save();
-        res.redirect("/" + customListName);
-      } else {
-        //Show an existing list
-
-        res.render("list", {listTitle: foundList.name, newListItems: foundList.items});
-      }
+  List.findOne({name: customListName}, function(err, foundList) {
+    if (err) return next(err);
+    if (foundList) {
+      return res.render("list", {listTitle: foundList.name, newListItems: foundList.items});
     }
-  });
-
-
-
-});
-
-app.post("/", function(req, res){
-
-  const itemName = req.body.newItem;
-  const listName = req.body.list;
-
-  const item = new Item({
-    name: itemName
-  });
-
-  if (listName === "Today"){
-    item.save();
-    res.redirect("/");
-  } else {
-    List.findOne({name: listName}, function(err, foundList){
-      foundList.items.push(item);
-      foundList.save();
-      res.redirect("/" + listName);
+    const list = new List({name: customListName, items: defaultItems});
+    list.save(function(saveError) {
+      if (saveError) return next(saveError);
+      res.redirect("/" + encodeURIComponent(customListName));
     });
-  }
+  });
 });
 
-app.post("/delete", function(req, res){
-  const checkedItemId = req.body.checkbox;
-  const listName = req.body.listName;
-
+app.post("/", function(req, res, next) {
+  const {newItem, list: listName} = req.body;
+  if (typeof newItem !== "string" || typeof listName !== "string" || !listName) {
+    return res.status(400).send("Item and list must be text");
+  }
   if (listName === "Today") {
-    Item.findByIdAndRemove(checkedItemId, function(err){
-      if (!err) {
-        console.log("Successfully deleted checked item.");
-        res.redirect("/");
-      }
-    });
-  } else {
-    List.findOneAndUpdate({name: listName}, {$pull: {items: {_id: checkedItemId}}}, function(err, foundList){
-      if (!err){
-        res.redirect("/" + listName);
-      }
+    return Item.create({name: newItem}, function(err) {
+      if (err) return next(err);
+      res.redirect("/");
     });
   }
+  List.findOneAndUpdate({name: listName}, {$push: {items: {name: newItem}}}, function(err, foundList) {
+    if (err) return next(err);
+    if (!foundList) return res.sendStatus(404);
+    res.redirect("/" + encodeURIComponent(listName));
+  });
+});
 
-
+app.post("/delete", function(req, res, next) {
+  const {checkbox: itemId, listName} = req.body;
+  if (!mongoose.isObjectIdOrHexString(itemId) || typeof listName !== "string" || !listName) {
+    return res.status(400).send("Invalid item or list");
+  }
+  if (listName === "Today") {
+    return Item.findByIdAndDelete(itemId, function(err) {
+      if (err) return next(err);
+      res.redirect("/");
+    });
+  }
+  List.findOneAndUpdate({name: listName}, {$pull: {items: {_id: itemId}}}, function(err, foundList) {
+    if (err) return next(err);
+    if (!foundList) return res.sendStatus(404);
+    res.redirect("/" + encodeURIComponent(listName));
+  });
 });
 
 app.get("/about", function(req, res){
@@ -140,7 +118,9 @@ if (port == null || port == "") {
   port = 3000;
 }
 
-
-app.listen(port, function() {
-  console.log("Server started successfully");
-});
+mongoose.connect(databaseUri)
+  .then(() => app.listen(port, () => console.log("Server started successfully")))
+  .catch(err => {
+    console.error("MongoDB connection failed", err.name);
+    process.exitCode = 1;
+  });
